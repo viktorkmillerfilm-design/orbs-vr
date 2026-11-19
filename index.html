@@ -4,7 +4,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <title>orbs vr · prototype</title>
 <style>
-html,body{margin:0;height:100%;background:#000;color:rgba(255,255,255,.75);font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;overflow:hidden;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+html,body{margin:0;height:100%;background:#010507;color:rgba(255,255,255,.75);font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;overflow:hidden;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
 canvas{display:block;touch-action:none}
 #bar{position:fixed;top:calc(10px + env(safe-area-inset-top));left:12px;right:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap;pointer-events:none}
 #bar>*{pointer-events:auto}
@@ -125,14 +125,30 @@ function tick() {
 setInterval(tick, 25);
 
 // ---- three ----
+const BG = 0x010507; // teal-black, like the kamino archive room
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight); renderer.setClearColor(0x000000, 1);
+renderer.setPixelRatio(Math.min(2, devicePixelRatio)); renderer.setSize(innerWidth, innerHeight); renderer.setClearColor(BG, 1);
 renderer.xr.enabled = true; renderer.xr.setReferenceSpaceType('local-floor');
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, .01, 50);
 const world = new THREE.Group(); scene.add(world); // the solar system
-const W = (a) => new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: a, depthWrite: false });
+const HOLO = 0xcfeaff, ADD = THREE.AdditiveBlending, uTime = { value: 0 };
+const W = (a) => new THREE.LineBasicMaterial({ color: HOLO, transparent: true, opacity: a, depthWrite: false, blending: ADD });
+// orbit rings: faint lines with a slow shimmer travelling around them (one cheap shader, no post-processing)
+function shimmerMat(a) {
+  const u = { uTime, uOp: { value: a }, uSeed: { value: Math.random() * 6.28 } };
+  const m = new THREE.ShaderMaterial({ uniforms: u, transparent: true, depthWrite: false, blending: ADD,
+    vertexShader: 'attribute float aAng; varying float vA; void main(){ vA = aAng; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform float uTime, uOp, uSeed; varying float vA; void main(){ float s = 0.62 + 0.38 * sin(vA * 3.0 - uTime * 0.9 + uSeed) * sin(vA * 7.0 + uTime * 0.37); gl_FragColor = vec4(0.80, 0.92, 1.0, min(1.0, uOp * s * 1.25)); }' });
+  Object.defineProperty(m, 'opacity', { get: () => u.uOp.value, set: v => { u.uOp.value = v; }, configurable: true });
+  return m;
+}
+// soft glow texture for light points and halos (sprites = fake bloom, fast on quest / iphone)
+const glowTex = (() => { const c = document.createElement('canvas'); c.width = c.height = 128; const x = c.getContext('2d'), g = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+  g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(.12, 'rgba(225,242,255,.75)'); g.addColorStop(.32, 'rgba(150,205,255,.22)'); g.addColorStop(.6, 'rgba(90,160,230,.06)'); g.addColorStop(1, 'rgba(0,0,0,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 128, 128); const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; })();
+const glow = (size, a, col = 0xa8d8ff) => { const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color: col, transparent: true, opacity: a, depthWrite: false, blending: ADD })); sp.scale.setScalar(size); return sp; };
 function wireSphere(r, lat, lon, a) { // latitude rings + meridians, like the planets-3d mockup
   const pts = [], seg = 40;
   for (let i = 1; i <= lat; i++) { const ph = -Math.PI / 2 + i * Math.PI / (lat + 1), y = Math.sin(ph) * r, rr = Math.cos(ph) * r; for (let j = 0; j < seg; j++) { const t0 = j / seg * TAU, t1 = (j + 1) / seg * TAU; pts.push(Math.cos(t0) * rr, y, Math.sin(t0) * rr, Math.cos(t1) * rr, y, Math.sin(t1) * rr); } }
@@ -140,7 +156,18 @@ function wireSphere(r, lat, lon, a) { // latitude rings + meridians, like the pl
   const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
   return new THREE.LineSegments(g, W(a));
 }
-function circle(r, a, seg = 128, dash) { const pts = []; for (let i = 0; i < seg; i++) { if (dash && i % 2) continue; const t0 = i / seg * TAU, t1 = (i + 1) / seg * TAU; pts.push(Math.sin(t0) * r, 0, -Math.cos(t0) * r, Math.sin(t1) * r, 0, -Math.cos(t1) * r); } const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); return new THREE.LineSegments(g, W(a)); }
+function circle(r, a, seg = 128, dash) { const pts = [], ang = []; for (let i = 0; i < seg; i++) { if (dash && i % 2) continue; const t0 = i / seg * TAU, t1 = (i + 1) / seg * TAU; pts.push(Math.sin(t0) * r, 0, -Math.cos(t0) * r, Math.sin(t1) * r, 0, -Math.cos(t1) * r); ang.push(t0, t1); } const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); g.setAttribute('aAng', new THREE.Float32BufferAttribute(ang, 1)); return new THREE.LineSegments(g, shimmerMat(a)); }
+// star field: a sparse cloud of tiny light points filling the room, twinkling and drifting (one draw call)
+function starField(n) {
+  const pos = [], seed = [];
+  for (let i = 0; i < n; i++) { let x, y, z, d; do { x = (Math.random() * 2 - 1) * 4.2; z = (Math.random() * 2 - 1) * 4.2; y = -0.75 + Math.random() * 1.85; d = Math.hypot(x, z); } while (d < 0.18 || d > 4.2);
+    const big = Math.random() < .06; pos.push(x, y, z); seed.push(Math.random() * 6.28, .3 + Math.random(), big ? .035 + Math.random() * .03 : .008 + Math.random() * .012); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('aSeed', new THREE.Float32BufferAttribute(seed, 3));
+  const m = new THREE.ShaderMaterial({ uniforms: { uTime, uPx: { value: 800 }, uOp: { value: .9 } }, transparent: true, depthWrite: false, blending: ADD,
+    vertexShader: 'attribute vec3 aSeed; uniform float uTime, uPx; varying float vA; void main(){ float ph = aSeed.x, sp = aSeed.y; vec3 p = position + vec3(sin(uTime*0.05*sp+ph), 0.5*cos(uTime*0.04*sp+ph*1.3), cos(uTime*0.045*sp+ph*0.7)) * 0.07; vec4 mv = modelViewMatrix * vec4(p,1.0); vA = 0.45 + 0.55 * pow(0.5 + 0.5 * sin(uTime * (0.6 + sp * 1.6) + ph * 9.0), 2.0); gl_PointSize = max(1.5, aSeed.z * uPx / max(0.05, -mv.z)); gl_Position = projectionMatrix * mv; }',
+    fragmentShader: 'uniform float uOp; varying float vA; void main(){ float d = length(gl_PointCoord - 0.5); float a = smoothstep(0.5, 0.0, d); a *= a; gl_FragColor = vec4(0.74, 0.9, 1.0, a * vA * uOp); }' });
+  const pts = new THREE.Points(g, m); pts.frustumCulled = false; return pts;
+}
 function textSprite(s, a = .6, h = .035) {
   const c = document.createElement('canvas'), x = c.getContext('2d'); c.width = 1024; c.height = 64;
   const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.minFilter = THREE.LinearFilter;
@@ -149,15 +176,18 @@ function textSprite(s, a = .6, h = .035) {
   m.set = (str) => { if (str === m._s) return; m._s = str; x.clearRect(0, 0, 1024, 64); x.font = '34px ui-monospace,Menlo,Consolas,monospace'; x.fillStyle = '#fff'; x.textAlign = 'center'; x.textBaseline = 'middle'; x.fillText(str, 512, 32); tex.needsUpdate = true; };
   m.set(s); return m;
 }
-const sun = wireSphere(.11, 5, 6, .5); world.add(sun);
-const sunCore = new THREE.Mesh(new THREE.SphereGeometry(.018, 12, 8), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: .7 })); world.add(sunCore);
+const sun = wireSphere(.11, 5, 6, .42); world.add(sun);
+const sunHalo = glow(.9, .55), sunHalo2 = glow(2.2, .12, 0x6fb6ff); world.add(sunHalo, sunHalo2);
+const stars = starField(touchy ? 520 : 700); world.add(stars);
+const sunCore = glow(.09, .9, 0xffffff); world.add(sunCore);
 const bands = LAPS.map((L, b) => { const g = new THREE.Group(), ring = circle(bandR(b), .05, 160, true), lab = textSprite(L + (L > 1 ? ' beats' : ' beat'), 0, .03); lab.position.set(bandR(b) + .02, .03, 0); g.add(ring, lab); g.ring = ring; g.lab = lab; world.add(g); return g; });
 const trig = (() => { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, -.13, 0, 0, -RMAX], 3)); return new THREE.LineSegments(g, W(.16)); })(); world.add(trig);
 const P = DEF.map(d => {
   const p = { ...d, lap: LAPS[d.band], r: bandR(d.band), rT: bandR(d.band), y: 0, yT: 0, oct: 0, grab: null, flash: 0, x: 0, z: 0, ang: d.a0 };
   p.g = new THREE.Group(); world.add(p.g);
-  p.sphere = wireSphere(d.size, 3, 4, .55); p.g.add(p.sphere);
-  p.core = new THREE.Mesh(new THREE.SphereGeometry(d.size * .96, 16, 12), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false })); p.g.add(p.core);
+  p.sphere = wireSphere(d.size, 3, 4, .5); p.g.add(p.sphere);
+  p.halo = glow(d.size * 6, .45); p.g.add(p.halo);
+  p.core = glow(d.size * 1.6, .9, 0xffffff); p.g.add(p.core); // bright light point at the centre
   p.hit = new THREE.Mesh(new THREE.SphereGeometry(Math.max(.1, d.size * 1.8), 8, 6), new THREE.MeshBasicMaterial({ visible: false })); p.hit.userData.p = p; p.g.add(p.hit);
   p.ripple = circle(d.size * 1.4, 0, 64); p.g.add(p.ripple);
   p.glow = circle(d.size * 1.9, 0, 64); p.g.add(p.glow);
@@ -275,14 +305,15 @@ function xrFollow() { for (const h of XRI) { if (!h.held) continue; let wp = nul
 
 async function xrSupported(m) { try { return !!(navigator.xr && await navigator.xr.isSessionSupported(m)); } catch (e) { return false; } }
 let xrMode = null;
+const XR_S = 1.6, XR_Y = 1.3, XR_Z = -0.95; // sun 0.95 m in front at 1.3 m; you stand between the 2- and 4-beat rings
 async function enterXR(m) {
   initAudio(); if (ac.state !== 'running') ac.resume();
   const opt = { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] };
   const s = await navigator.xr.requestSession(m, opt);
   xrMode = m; await renderer.xr.setSession(s);
-  world.position.set(0, 1.05, -.55); // room-scale: sun at chest height in front of you, outer orbits pass around you
+  world.position.set(0, XR_Y, XR_Z); world.scale.setScalar(XR_S); // stand inside: rings 0.5–2.1 m wide around you, planets 0.8–1.8 m high
   xrUI.visible = true; if (m === 'immersive-ar') { renderer.setClearColor(0x000000, 0); scene.background = null; }
-  s.addEventListener('end', () => { xrMode = null; world.position.set(0, 0, 0); xrUI.visible = false; renderer.setClearColor(0x000000, 1); for (const h of XRI) xrRelease(h); ui(); });
+  s.addEventListener('end', () => { xrMode = null; world.position.set(0, 0, 0); world.scale.setScalar(1); xrUI.visible = false; renderer.setClearColor(BG, 1); for (const h of XRI) xrRelease(h); ui(); });
   ui(); return s;
 }
 xrSupported('immersive-vr').then(ok => { $('evr').hidden = !ok; });
@@ -325,17 +356,19 @@ renderer.setAnimationLoop(() => {
     p.orbit.scale.setScalar(p.grab ? bandR(bandOfR(p.r)) : p.r); p.orbit.position.y = p.grab ? octOfY(p.y) * OCT_H : p.y; p.orbit.material.opacity = p.grab ? .35 : .12;
     const sp = p.stem.geometry.attributes.position; sp.setXYZ(0, p.x, p.y, p.z); sp.setXYZ(1, p.x, 0, p.z); sp.needsUpdate = true; p.stem.material.opacity = Math.abs(p.y) > .02 ? .18 : 0;
     p.flash = Math.max(0, p.flash - dt * 4); const held = !!p.grab;
-    p.core.material.opacity = held ? .35 : p.flash * .85; p.sphere.material.opacity = held ? 1 : .55 + .45 * p.flash;
+    p.core.material.opacity = held ? 1 : .55 + .45 * p.flash; p.sphere.material.opacity = held ? .95 : .4 + .5 * p.flash;
+    p.halo.material.opacity = held ? .9 : .32 + .5 * p.flash; p.halo.scale.setScalar(p.size * (held ? 9 : 6 + 5 * p.flash) * (1 + .06 * Math.sin(uTime.value * 1.7 + p.size * 99)));
     p.g.scale.setScalar(held ? 1.35 : 1 + .25 * p.flash);
     p.glow.material.opacity = held ? .9 : 0; p.glow.rotation.y += dt;
     if (p.rip != null) { p.rip += dt * 2.5; p.ripple.scale.setScalar(1 + p.rip * 2); p.ripple.material.opacity = Math.max(0, .45 * (1 - p.rip)); if (p.rip > 1) p.rip = null; }
     p.label.set(held ? preview(p) : p.id); p.label.material.opacity = held ? .95 : .4; const lh = (renderer.xr.isPresenting ? .03 : .042 * C.dist / 2.8) * (held ? 1.3 : 1); p.label.scale.set(lh * 16, lh, 1);
   }
-  sunCore.material.opacity = S.playing ? .5 + .4 * Math.pow(1 - frac(beat), 3) : .35;
+  const pulse = S.playing ? Math.pow(1 - frac(beat), 3) : 0; sunCore.material.opacity = .6 + .4 * pulse; sunHalo.material.opacity = .4 + .25 * pulse; sunHalo.scale.setScalar(.85 + .12 * pulse);
+  uTime.value += dt; stars.material.uniforms.uPx.value = renderer.xr.isPresenting ? 900 : innerHeight * renderer.getPixelRatio() / (2 * Math.tan(camera.fov * Math.PI / 360));
   renderer.render(scene, camera);
 });
 const info = () => P.map(p => ({ id: p.id, lap: p.lap, r: +p.r.toFixed(3), rT: +p.rT.toFixed(3), oct: p.oct, y: +p.y.toFixed(3) }));
-window.VR = { S, P, LAPS, bandR, play, stop, setBpm, info, renderer, camera, world, enterXR, XRI, get ac() { return ac; }, get analyser() { return analyser; },
+window.VR = { XR_S, stars, S, P, LAPS, bandR, play, stop, setBpm, info, renderer, camera, world, enterXR, XRI, get ac() { return ac; }, get analyser() { return analyser; },
   screenOf(x, y, z) { const v = new THREE.Vector3(x, y, z); world.localToWorld(v); v.project(camera); return { x: (v.x + 1) / 2 * innerWidth, y: (1 - v.y) / 2 * innerHeight }; },
   planetScreen(id) { const p = P.find(q => q.id === id); return this.screenOf(p.x, p.y, p.z); },
   planetWorld(id) { const p = P.find(q => q.id === id); return wpos(p.g); } };
