@@ -197,10 +197,12 @@ const P = DEF.map(d => {
   return p;
 });
 const hitMeshes = P.map(p => p.hit);
-// in-world transport (used in xr, where the dom bar is gone): play/stop + bpm − / +
-const xrUI = new THREE.Group(); world.add(xrUI); xrUI.visible = false; xrUI.position.set(0, -.26, 0);
-const xrBtn = (txt, x, fn) => { const s = textSprite(txt, .8, .045); s.position.x = x; const hm = new THREE.Mesh(new THREE.BoxGeometry(.14, .06, .04), new THREE.MeshBasicMaterial({ visible: false })); hm.position.x = x; hm.userData.fn = fn; xrUI.add(s, hm); s.hm = hm; return s; };
+// in-world panel (xr has no dom bar): play/stop · bpm − / + · place here. it sits on the left wrist (or floats, world-locked, where you entered)
+const xrUI = new THREE.Group(); scene.add(xrUI); xrUI.visible = false;
+const xrBtn = (txt, x, fn, y = 0) => { const s = textSprite(txt, .8, .045); s.position.set(x, y, 0); const hm = new THREE.Mesh(new THREE.BoxGeometry(.14, .06, .04), new THREE.MeshBasicMaterial({ visible: false })); hm.position.set(x, y, 0); hm.userData.fn = fn; hm.userData.label = txt; xrUI.add(s, hm); s.hm = hm; return s; };
 const xrPlay = xrBtn('play', -.2, () => S.playing ? stop() : play()), xrMinus = xrBtn('−', .02, () => setBpm(S.bpm - 5)), xrBpm = xrBtn('120 bpm', .15, () => {}), xrPlus = xrBtn('+', .3, () => setBpm(S.bpm + 5));
+const xrPlace = xrBtn('place here', .05, () => requestPlace(null), -.08);
+const xrStatus = textSprite('', .45, .03); xrStatus.position.set(.05, .07, 0); xrUI.add(xrStatus);
 const xrHits = xrUI.children.filter(c => c.isMesh);
 
 // ---- camera (desktop / phone): orbit by dragging empty space, wheel / pinch zoom ----
@@ -274,11 +276,12 @@ const XRI = [0, 1].map(i => {
   grip.add(ctrlFactory.createControllerModel(grip)); hand.add(handFactory.createHandModel(hand, 'spheres'));
   scene.add(ctrl, grip, hand);
   const h = { i, ctrl, grip, hand, line, held: null, off: new THREE.Vector3(), inputSource: null, isHand: false };
-  ctrl.addEventListener('connected', e => { h.inputSource = e.data; h.isHand = !!e.data.hand; line.visible = !h.isHand; });
+  ctrl.addEventListener('connected', e => { h.inputSource = e.data; h.isHand = !!e.data.hand; h.handed = e.data.handedness; line.visible = !h.isHand; if (renderer.xr.isPresenting) dockUI(); });
   ctrl.addEventListener('disconnected', () => { if (h.held) grabEnd(h.held); h.held = null; h.inputSource = null; });
-  const start = () => { if (h.held || h.isHand) return; xrGrab(h, grip.position.lengthSq() ? grip : ctrl, ctrl); };
-  ctrl.addEventListener('squeezestart', start); ctrl.addEventListener('selectstart', e => { if (!xrUiPress(ctrl) ) start(); });
-  ctrl.addEventListener('squeezeend', () => xrRelease(h)); ctrl.addEventListener('selectend', () => xrRelease(h));
+  const start = () => { if (h.held || h.isHand) return false; return xrGrab(h, grip.position.lengthSq() ? grip : ctrl, ctrl); };
+  ctrl.addEventListener('squeezestart', () => { if (!start() && !h.isHand) h.pressT = performance.now(); }); // squeeze on empty space, held 0.7 s = place here
+  ctrl.addEventListener('selectstart', e => { if (!xrUiPress(ctrl)) start(); });
+  ctrl.addEventListener('squeezeend', () => { h.pressT = 0; xrRelease(h); }); ctrl.addEventListener('selectend', () => xrRelease(h));
   hand.addEventListener('pinchstart', () => { if (h.held) return; const p = pinchPoint(hand); if (!p) return; if (xrUiTouch(p)) return; xrGrabAt(h, p, null); });
   hand.addEventListener('pinchend', () => xrRelease(h));
   return h;
@@ -305,15 +308,84 @@ function xrFollow() { for (const h of XRI) { if (!h.held) continue; let wp = nul
 
 async function xrSupported(m) { try { return !!(navigator.xr && await navigator.xr.isSessionSupported(m)); } catch (e) { return false; } }
 let xrMode = null;
-const XR_S = 1.6, XR_Y = 1.3, XR_Z = -0.95; // sun 0.95 m in front at 1.3 m; you stand between the 2- and 4-beat rings
+// ---- world-locked placement ----
+// the system is a fixed object in the room: placed once in 'local-floor' space (sun at 1.3 m), never moved by the head.
+// order on entry: saved xr anchor → saved local-floor offset → centre of the bounded play area → the spot you stand on.
+// 'place here' (wrist button, 0.7 s squeeze on empty space, or thumbstick click) moves it to where you point at the floor, or where you stand.
+const XR_S = 1.6, XR_Y = 1.3, PLACE_KEY = 'orbsvr.place.v1';
+const X = { session: null, ref: null, bounded: undefined, placed: false, anchor: null, pending: null, head: new THREE.Vector3(), src: '', t0: 0 };
+const loadPlace = () => { try { return JSON.parse(localStorage.getItem(PLACE_KEY) || 'null'); } catch (e) { return null; } };
+const savePlace = o => { try { localStorage.setItem(PLACE_KEY, JSON.stringify(Object.assign({ t: Date.now() }, o))); } catch (e) {} };
+const yawOf = q => { const e = new THREE.Euler().setFromQuaternion(q, 'YXZ'); return e.y; };
+function setWorld(x, z, yaw, src) { world.position.set(x, XR_Y, z); world.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw || 0); X.placed = true; X.src = src; xrStatus.set(src); }
+function requestPlace(h) { // where you point at the floor (within 8 m), else where you stand
+  let x = X.head.x, z = X.head.z, how = 'placed where you stand';
+  if (h) { const m = new THREE.Matrix4().extractRotation(h.ctrl.matrixWorld), o = new THREE.Vector3().setFromMatrixPosition(h.ctrl.matrixWorld), d = new THREE.Vector3(0, 0, -1).applyMatrix4(m);
+    if (d.y < -.15) { const t = -o.y / d.y; if (t < 8) { x = o.x + d.x * t; z = o.z + d.z * t; how = 'placed where you point'; } } }
+  setWorld(x, z, yawOf(world.quaternion), how); X.pending = { x, z, yaw: yawOf(world.quaternion) }; // saved + anchored on the next frame (needs an XRFrame)
+}
+function persist(frame, x, z, yaw) {
+  const old = loadPlace(); savePlace({ x, z, yaw, space: 'local-floor' });
+  if (!frame.createAnchor || !X.ref) return;
+  const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+  frame.createAnchor(new XRRigidTransform({ x, y: XR_Y, z, w: 1 }, { x: q.x, y: q.y, z: q.z, w: q.w }), X.ref).then(async a => {
+    if (X.anchor && X.anchor.delete) try { X.anchor.delete(); } catch (e) {}
+    X.anchor = a; xrStatus.set(X.src + ' · anchored');
+    if (a.requestPersistentHandle) { try { const uuid = await a.requestPersistentHandle(); savePlace({ x, z, yaw, space: 'local-floor', anchor: uuid }); if (old && old.anchor && old.anchor !== uuid && X.session.deletePersistentAnchor) X.session.deletePersistentAnchor(old.anchor).catch(() => {}); } catch (e) {} }
+  }).catch(() => {});
+}
+function initialPlace(frame) {
+  const saved = loadPlace();
+  if (saved && isFinite(saved.x) && isFinite(saved.z)) {
+    setWorld(saved.x, saved.z, saved.yaw || 0, 'restored');
+    if (saved.anchor && X.session.restorePersistentAnchor) X.session.restorePersistentAnchor(saved.anchor).then(a => { X.anchor = a; xrStatus.set('restored · anchored'); }).catch(() => persist(frame, saved.x, saved.z, saved.yaw || 0));
+    else X.pending = { x: saved.x, z: saved.z, yaw: saved.yaw || 0 };
+    return;
+  }
+  if (X.bounded === undefined && performance.now() - X.t0 < 800) return; // give bounded-floor a moment
+  if (X.bounded && X.bounded.boundsGeometry && X.bounded.boundsGeometry.length >= 3) { // centroid of the play area, converted into local-floor
+    const pose = frame.getPose(X.bounded, X.ref);
+    if (pose) { let cx = 0, cz = 0; const b = X.bounded.boundsGeometry; for (const p of b) { cx += p.x; cz += p.z; } const c = new THREE.Vector3(cx / b.length, 0, cz / b.length).applyMatrix4(new THREE.Matrix4().fromArray(pose.transform.matrix));
+      setWorld(c.x, c.z, 0, 'play-area centre'); X.pending = { x: c.x, z: c.z, yaw: 0 }; return; }
+  }
+  setWorld(X.head.x, X.head.z, 0, 'placed where you stood'); X.pending = { x: X.head.x, z: X.head.z, yaw: 0 };
+}
+function onRefReset(e) { // quest recentring: keep the system on the same real-world spot
+  if (X.anchor) return; // an anchor is tracked by the headset and already lands in the right place
+  if (!e.transform) return;
+  const M = new THREE.Matrix4().fromArray(e.transform.inverse.matrix); world.position.applyMatrix4(M); world.position.y = XR_Y;
+  const yaw = yawOf(world.quaternion) + yawOf(new THREE.Quaternion(e.transform.inverse.orientation.x, e.transform.inverse.orientation.y, e.transform.inverse.orientation.z, e.transform.inverse.orientation.w));
+  world.quaternion.setFromAxisAngle(new THREE.Vector3(0, 1, 0), yaw); savePlace({ x: world.position.x, z: world.position.z, yaw, space: 'local-floor' });
+}
+function xrPlaceFrame(frame) { // runs every xr frame
+  if (!frame || !X.ref) return;
+  const vp = frame.getViewerPose(X.ref); if (vp) { const p = vp.transform.position; X.head.set(p.x, p.y, p.z); }
+  if (!X.placed) initialPlace(frame);
+  if (X.pending) { const q = X.pending; X.pending = null; persist(frame, q.x, q.z, q.yaw); }
+  if (X.anchor && frame.trackedAnchors && frame.trackedAnchors.has(X.anchor)) { const ap = frame.getPose(X.anchor.anchorSpace, X.ref); if (ap) { const t = ap.transform; world.position.set(t.position.x, t.position.y, t.position.z); world.quaternion.set(t.orientation.x, t.orientation.y, t.orientation.z, t.orientation.w); } }
+  for (const h of XRI) { // long squeeze on empty space / thumbstick click → place here
+    if (h.pressT && !h.held && performance.now() - h.pressT > 700) { h.pressT = 0; requestPlace(h); }
+    const gp = h.inputSource && h.inputSource.gamepad, b = gp && gp.buttons[3], down = !!(b && b.pressed);
+    if (down && !h.stick) requestPlace(h); h.stick = down;
+  }
+}
+function dockUI() { // left wrist if there is a left controller/hand, else a world-locked panel where you entered
+  const L = XRI.find(h => h.inputSource && h.handed === 'left');
+  if (L) { L.grip.add(xrUI); xrUI.position.set(0, .06, .07); xrUI.rotation.set(-.9, 0, 0); xrUI.scale.setScalar(.55); }
+  else { scene.add(xrUI); xrUI.position.set(X.head.x, 1.0, X.head.z - .5); xrUI.rotation.set(-.5, 0, 0); xrUI.scale.setScalar(.8); }
+}
 async function enterXR(m) {
   initAudio(); if (ac.state !== 'running') ac.resume();
-  const opt = { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking'] };
+  const opt = { optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'anchors'] };
   const s = await navigator.xr.requestSession(m, opt);
   xrMode = m; await renderer.xr.setSession(s);
-  world.position.set(0, XR_Y, XR_Z); world.scale.setScalar(XR_S); // stand inside: rings 0.5–2.1 m wide around you, planets 0.8–1.8 m high
-  xrUI.visible = true; if (m === 'immersive-ar') { renderer.setClearColor(0x000000, 0); scene.background = null; }
-  s.addEventListener('end', () => { xrMode = null; world.position.set(0, 0, 0); world.scale.setScalar(1); xrUI.visible = false; renderer.setClearColor(BG, 1); for (const h of XRI) xrRelease(h); ui(); });
+  Object.assign(X, { session: s, ref: renderer.xr.getReferenceSpace(), bounded: undefined, placed: false, anchor: null, pending: null, t0: performance.now() });
+  s.requestReferenceSpace('bounded-floor').then(b => X.bounded = b, () => X.bounded = null);
+  X.ref.addEventListener('reset', onRefReset);
+  world.scale.setScalar(XR_S); // planets 0.8–1.8 m high, rings 0.5–2.1 m out from the sun
+  xrUI.visible = true; dockUI(); if (m === 'immersive-ar') { renderer.setClearColor(0x000000, 0); scene.background = null; }
+  s.addEventListener('end', () => { xrMode = null; if (X.ref) X.ref.removeEventListener('reset', onRefReset); if (X.anchor && X.anchor.delete) try { X.anchor.delete(); } catch (e) {} Object.assign(X, { session: null, ref: null, anchor: null, placed: false });
+    world.position.set(0, 0, 0); world.quaternion.identity(); world.scale.setScalar(1); xrUI.visible = false; renderer.setClearColor(BG, 1); for (const h of XRI) xrRelease(h); ui(); });
   ui(); return s;
 }
 xrSupported('immersive-vr').then(ok => { $('evr').hidden = !ok; });
@@ -342,9 +414,9 @@ ui();
 
 // ---- frame loop ----
 const clock = new THREE.Clock();
-renderer.setAnimationLoop(() => {
+renderer.setAnimationLoop((time, frame) => {
   const dt = Math.min(.05, clock.getDelta()), beat = curBeat(), now = ac ? ac.currentTime : 0;
-  if (renderer.xr.isPresenting) xrFollow();
+  if (renderer.xr.isPresenting) { xrPlaceFrame(frame); xrFollow(); }
   while (S.flashes.length && S.flashes[0].t <= now) { const f = S.flashes.shift(); f.p.flash = Math.max(f.p.flash, .4 + .6 * f.v); f.p.rip = 0; }
   if (S.flashes.length > 400) S.flashes.splice(0, S.flashes.length - 400);
   const g = S.grabbed;
@@ -368,7 +440,7 @@ renderer.setAnimationLoop(() => {
   renderer.render(scene, camera);
 });
 const info = () => P.map(p => ({ id: p.id, lap: p.lap, r: +p.r.toFixed(3), rT: +p.rT.toFixed(3), oct: p.oct, y: +p.y.toFixed(3) }));
-window.VR = { XR_S, stars, S, P, LAPS, bandR, play, stop, setBpm, info, renderer, camera, world, enterXR, XRI, get ac() { return ac; }, get analyser() { return analyser; },
+window.VR = { XR_S, X, xrUI, PLACE_KEY, requestPlace, onRefReset, stars, S, P, LAPS, bandR, play, stop, setBpm, info, renderer, camera, world, enterXR, XRI, get ac() { return ac; }, get analyser() { return analyser; },
   screenOf(x, y, z) { const v = new THREE.Vector3(x, y, z); world.localToWorld(v); v.project(camera); return { x: (v.x + 1) / 2 * innerWidth, y: (1 - v.y) / 2 * innerHeight }; },
   planetScreen(id) { const p = P.find(q => q.id === id); return this.screenOf(p.x, p.y, p.z); },
   planetWorld(id) { const p = P.find(q => q.id === id); return wpos(p.g); } };
